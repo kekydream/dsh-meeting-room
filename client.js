@@ -79,6 +79,14 @@ window.__ModuleLoader__.load({
     const MIN_CHUNK_SECONDS = 1.2
 
     /**
+     * How long an armed Stop ignores clicks before it accepts them. A double click on Stop is a
+     * habit, not a decision: without this, the second click of a double click would confirm the
+     * stop the first one only armed. Long enough to swallow a double click, short enough that a
+     * deliberate second press is not felt as lag.
+     */
+    const STOP_ARM_DELAY_MS = 380
+
+    /**
      * Hard ceiling per request; a speaker who never pauses still gets periodic cues. The
      * recognizer is request/response, so this ceiling — not a partial hypothesis — is what
      * decides how live the transcript feels during a long uninterrupted sentence.
@@ -473,6 +481,11 @@ registerProcessor('meeting-capture', MeetingCapture)
       stopRemaining: '剩余',
       stopElapsed: '已等待',
       stopFinished: '收尾完成，会议已保存',
+      stopConfirm: '确认停止',
+      stopConfirmHint: '再点一次「确认停止」才会结束这场会议并收尾；只想歇一下请点「暂停」，会议不会结束。',
+      resumeMeeting: '继续记录',
+      newMeeting: '新建会议',
+      resumedNote: '已继续记录：新内容接在上一段之后',
       hubLastTopic: '上次会议',
       hubTabSettings: '设置',
       hubTabPeople: '人员管理',
@@ -897,6 +910,11 @@ registerProcessor('meeting-capture', MeetingCapture)
       stopRemaining: 'left',
       stopElapsed: 'waited',
       stopFinished: 'Finished — the meeting is saved',
+      stopConfirm: 'Confirm stop',
+      stopConfirmHint: 'Press again to end this meeting and finish it. To take a break use Pause — the meeting stays open and nothing is lost.',
+      resumeMeeting: 'Resume recording',
+      newMeeting: 'New meeting',
+      resumedNote: 'Recording resumed — what follows continues this meeting',
       hubLastTopic: 'Last meeting',
       hubTabSettings: 'Settings',
       hubTabPeople: 'People',
@@ -1028,6 +1046,11 @@ registerProcessor('meeting-capture', MeetingCapture)
       button: { padding: '5px 12px', borderRadius: '6px', cursor: 'pointer', fontSize: '13px' },
       headerButton: { padding: '4px 10px', borderRadius: '6px', cursor: 'pointer', fontSize: '12px' },
       status: { fontSize: '12px', opacity: 0.8 },
+      /**
+       * The stop progress under the Start/Stop button. The corner toast keeps its own copy;
+       * this one sits where the click happened, and tabular digits keep it from jittering.
+       */
+      finishLine: { margin: 0, fontSize: '12px', opacity: 0.85, lineHeight: 1.4, fontVariantNumeric: 'tabular-nums' },
       label: { display: 'block', fontSize: '12px', fontWeight: 600, marginBottom: '2px' },
       /** A labelled field that stacks instead of sitting in one row (the summary block). */
       fieldBlock: { display: 'flex', flexDirection: 'column', gap: '4px' },
@@ -1178,6 +1201,15 @@ registerProcessor('meeting-capture', MeetingCapture)
       player: { display: 'flex', flexDirection: 'column', gap: '8px' },
       playerList: { display: 'flex', flexDirection: 'column', gap: '4px', maxHeight: '360px', overflowY: 'auto' },
       buttonActive: { padding: '5px 12px', borderRadius: '6px', cursor: 'pointer', fontSize: '13px', background: 'var(--dsw-alias-bg-layer-2)' },
+      /**
+       * Pause is the everyday action while a meeting is running, so it carries the accent; Stop
+       * sits beside it and must not read as the obvious button. Borders are drawn with an inset
+       * ring instead of a real border, so switching states cannot shift the row by a pixel.
+       */
+      buttonPrimary: { color: 'var(--dsw-alias-brand-primary)', background: 'color-mix(in srgb, var(--dsw-alias-brand-primary) 12%, transparent)', boxShadow: 'inset 0 0 0 1px var(--dsw-alias-brand-primary)' },
+      buttonQuiet: { color: 'var(--dsw-alias-label-secondary)', boxShadow: 'inset 0 0 0 1px var(--dsw-alias-border-l2)' },
+      /** Armed stop: the second press ends the meeting, so it is painted as the risk it is. */
+      buttonDanger: { color: 'var(--dsw-alias-state-error-primary)', background: 'color-mix(in srgb, var(--dsw-alias-state-error-primary) 12%, transparent)', boxShadow: 'inset 0 0 0 1px var(--dsw-alias-state-error-primary)' },
       inlineInput: { padding: '2px 6px', borderRadius: '4px', fontSize: '12px', width: '72px', fontFamily: 'inherit', boxSizing: 'border-box' },
       smallButton: { padding: '1px 8px', borderRadius: '4px', cursor: 'pointer', fontSize: '11px' },
       /** The overflow menu hangs under its button instead of widening the action row. */
@@ -2300,6 +2332,32 @@ function periodBucketOf(startedAt, unit) {
       const audioName = rec.audioName
       const [error, setError] = React.useState('')
       const [note, setNote] = React.useState('')
+      /**
+       * The stop-in-progress notice drawn under the Start/Stop button: `null` while nothing is
+       * finishing, otherwise `{ remaining, seconds, done }`. It deliberately repeats what the
+       * corner toast says — the person just pressed that button, so the progress belongs where
+       * their eyes already are, and the toast stays for anyone watching the corner.
+       */
+      const [finishing, setFinishing] = React.useState(null)
+      /**
+       * When the last stop finished, in ms; 0 when there is nothing to go back to. Stop sits one
+       * click away from Pause, so a mistaken stop has to be walkable back: this is what turns the
+       * primary button into 继续记录 instead of quietly opening a second, empty meeting.
+       */
+      const [stoppedAt, setStoppedAt] = React.useState(0)
+      /** A Stop click waiting for its confirmation; a second press within four seconds stops. */
+      const [stopArmed, setStopArmed] = React.useState(false)
+      const stopArmTimer = React.useRef(0)
+      /** When the arm started, so a double click cannot count as its confirmation. */
+      const stopArmedAt = React.useRef(0)
+      /** Which action the "prepare the model, then go" chain should carry out. */
+      const pendingResume = React.useRef(false)
+      /**
+       * Bumped after every stop, so the player refetches the file: a continued recording keeps
+       * its name, and without this the audio element would play the bytes it cached before the
+       * stop, silently dropping everything added after it.
+       */
+      const [audioRev, setAudioRev] = React.useState(0)
       const [termsText, setTermsText] = React.useState(readTerms)
       const [speaker, setSpeaker] = React.useState({ phase: 'unprepared', message: '', completedBytes: 0, totalBytes: 0 })
       /**
@@ -3355,6 +3413,10 @@ function periodBucketOf(startedAt, unit) {
         } catch { /* a closed stream has nothing to switch off */ }
         // A pause boundary is a boundary: buffered audio is dropped, never split later.
         if (next) active.pending.length = 0
+        // Pausing is the answer to "I only want a break", so it also cancels a half-armed
+        // stop: one click on Pause must leave nothing that ends the meeting behind.
+        setStopArmed(false)
+        window.clearTimeout(stopArmTimer.current)
         setPaused(next)
         pausedAt.current = next ? Date.now() : 0
         pauseWarned.current = false
@@ -3492,6 +3554,8 @@ function periodBucketOf(startedAt, unit) {
         setPicker({ open: false, query: '', rows: [], loading: false })
         try {
           const value = await get(`/state?meetingId=${encodeURIComponent(row.meetingId)}`)
+          // Reading another meeting is not "continue the one that just stopped".
+          setStoppedAt(0)
           setViewed({ meetingId: row.meetingId, sessionId: row.sessionId, title: typeof value.title === 'string' ? value.title : row.title })
           setSegments(Array.isArray(value.segments) ? value.segments : [])
           setSeconds(typeof value.seconds === 'number' ? value.seconds : 0)
@@ -3878,117 +3942,192 @@ function periodBucketOf(startedAt, unit) {
         }
       }, [])
 
-      /** Start a meeting and begin capture. */
+      /**
+       * Open the microphone and attach it to a meeting the host already has open for capture.
+       *
+       * `start()` (a new meeting) and `resume()` (the one that just stopped) both land here, so
+       * the permission prompt, the worklet and the flush loop exist exactly once.
+       * @param created - host reply to /start or /resume.
+       * @param options - `continue`: keep the segments and the clock this meeting already has.
+       */
+      const beginCapture = React.useCallback(async (created, options) => {
+        const continuing = options?.continue === true
+        let audio
+        try {
+          audio = new AudioContext({ sampleRate: TARGET_RATE })
+        } catch {
+          // Chromium rejects an unsupported rate; the box filter in toPcm16 handles any rate.
+          audio = new AudioContext()
+        }
+        await audio.resume()
+        let stream
+        try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }) } catch (micErr) { const nm = micErr && typeof micErr.name === 'string' ? micErr.name : ''; if (nm === 'NotAllowedError' || nm === 'PermissionDeniedError') throw new Error('\u65e0\u6cd5\u8bbf\u95ee\u9ea6\u514b\u98ce\uff1a\u8bf7\u5728\u7cfb\u7edf\u8bbe\u7f6e\u91cc\u5141\u8bb8 DeepSeek Harness \u4f7f\u7528\u9ea6\u514b\u98ce'); if (nm === 'NotFoundError') throw new Error('\u6ca1\u6709\u68c0\u6d4b\u5230\u9ea6\u514b\u98ce\u8bbe\u5907'); throw new Error('\u65e0\u6cd5\u542f\u52a8\u9ea6\u514b\u98ce: ' + (micErr instanceof Error ? micErr.message : String(micErr))) }
+        const url = URL.createObjectURL(new Blob([WORKLET_SOURCE], { type: 'application/javascript' }))
+        await audio.audioWorklet.addModule(url)
+        const source = audio.createMediaStreamSource(stream)
+        const node = new AudioWorkletNode(audio, 'meeting-capture')
+        const sink = audio.createGain()
+        sink.gain.value = 0
+        source.connect(node)
+        node.connect(sink)
+        sink.connect(audio.destination)
+
+        const priorSeconds = typeof created.seconds === 'number' ? created.seconds : 0
+        const active = {
+          meetingId: created.meetingId,
+          audio, stream, source, node, sink, url,
+          pending: [],
+          frames: 0,
+          // Audio captured so far in this meeting, in samples. It drives the live elapsed
+          // clock; the host's own count stays authoritative once a cue is transcribed. A
+          // continued recording starts from what the meeting already holds, so its clock keeps
+          // counting up from where the stop left it instead of restarting at 0:00.
+          captured: continuing ? Math.round(priorSeconds * audio.sampleRate) : 0,
+          ticker: 0,
+          silenceFrames: 0,
+          inflight: false,
+          stopping: false,
+          // A paused capture drops what a pause would otherwise record (§5.6).
+          paused: false,
+        }
+        recorder.active = active
+        node.port.onmessage = (event) => {
+          // While paused nothing is buffered, so the exported recording carries no hole.
+          if (active.paused === true) return
+          const block = event.data
+          active.pending.push(block)
+          active.frames += block.length
+          active.captured += block.length
+          // Endpoint at a pause instead of a fixed clock: a cue then holds what a
+          // speaker actually said, rather than being cut mid-sentence. The cap keeps
+          // a long monologue from growing without bound.
+          if (blockRms(block) < CUES.silenceRms) active.silenceFrames += block.length
+          else active.silenceFrames = 0
+          if (!active.inflight && shouldFlush(active)) void flush(active)
+        }
+        // The elapsed clock ticks on captured audio, not on wall time: a pause stops the
+        // count without leaving a gap in the recording (§5.6).
+        active.ticker = setInterval(() => {
+          if (active.paused === true) return
+          setSeconds(Math.round(active.captured / active.audio.sampleRate))
+        }, 1000)
+        setPaused(false)
+        pausedAt.current = 0
+        pauseWarned.current = false
+        if (continuing) {
+          // The record stays on screen: only the clock moves, so the cues from before the stop
+          // and after it read as one meeting rather than two unrelated ones.
+          setSeconds(Math.round(priorSeconds))
+        } else {
+          setSegments([])
+          setSeconds(0)
+          setStartedAt(created.startedAt ?? Date.now())
+        }
+        setMeetingId(created.meetingId)
+        setAudioName(typeof created.audioName === 'string' ? created.audioName : '')
+        setPhase('recording')
+        // Recording belongs to this Session: show that conversation in the main panel and
+        // this meeting's record in the right column, whatever was in front before.
+        try {
+          if (typeof props.revealConversation === 'function') props.revealConversation(sessionId)
+        } catch (failure) {
+          console.warn('meeting-room: could not reveal the meeting conversation', failure)
+        }
+        try {
+          if (typeof props.focusMeetingPanel === 'function') props.focusMeetingPanel()
+        } catch (failure) {
+          console.warn('meeting-room: could not bring the meeting tab forward', failure)
+        }
+      }, [flush, sessionId])
+
+      /** Start a new meeting and begin capture. */
       const start = React.useCallback(async () => {
         setError('')
         setNote('')
         if (speech.ready !== true) {
           // One click covers the whole chain: enable the voice-input bundle if it is off,
           // download the model if it is missing, then start recording once it is ready.
+          pendingResume.current = false
+          setPendingStart(true)
+          void prepareSpeech()
+          return
+        }
+        setPhase('starting')
+        // Take the frame BEFORE capture begins: the same take-over the header's 会议记录 button
+        // performs (workspace rail in, meeting column open at its widest). It sits here, in the
+        // one place a recording can start, so every trigger lands identically — the panel's own
+        // button, the start page's card, or an agent that asked for the start. The model never
+        // touches the layout, so a truncated or filtered reply cannot leave the panel cramped.
+        try {
+          if (typeof props.focusMeeting === 'function') props.focusMeeting()
+        } catch (failure) {
+          console.warn('meeting-room: could not take over the frame for the meeting', failure)
+        }
+        try {
+          // Read here, not at the top: a start that first waits for the model keeps the flag for
+          // the run that actually reaches the host. `auto` stops the host from prompting the
+          // agent again when the agent is the one that asked for this start.
+          const auto = recorder.autoStart === true
+          recorder.autoStart = false
+          const created = await post('/start', { sessionId, terms: termsText, auto })
+          // A fresh meeting is no longer the one that stopped, so 继续记录 must go away.
+          setStoppedAt(0)
+          await beginCapture(created, {})
+        } catch (failure) {
+          await release()
+          setPhase('idle')
+          setError(failure instanceof Error ? failure.message : String(failure))
+        }
+      }, [beginCapture, prepareSpeech, release, sessionId, termsText, speech.ready])
+
+      /**
+       * Continue the meeting that just stopped: the one-click way back from a mistaken Stop.
+       *
+       * The microphone reopens, the audio keeps appending to the same WAV and the cues continue
+       * on the same timeline — so the meeting is one record, not two, and nothing that was
+       * already transcribed is hidden behind a second, empty meeting.
+       */
+      const resume = React.useCallback(async () => {
+        if (meetingId === '') return
+        setError('')
+        setNote('')
+        if (speech.ready !== true) {
+          pendingResume.current = true
           setPendingStart(true)
           void prepareSpeech()
           return
         }
         setPhase('starting')
         try {
-          // Read here, not at the top: a start that first waits for the model keeps the flag for
-      // the run that actually reaches the host. `auto` stops the host from prompting the
-      // agent again when the agent is the one that asked for this start.
-      const auto = recorder.autoStart === true
-      recorder.autoStart = false
-      const created = await post('/start', { sessionId, terms: termsText, auto })
-          let audio
-          try {
-            audio = new AudioContext({ sampleRate: TARGET_RATE })
-          } catch {
-            // Chromium rejects an unsupported rate; the box filter in toPcm16 handles any rate.
-            audio = new AudioContext()
-          }
-          await audio.resume()
-          let stream
-          try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }) } catch (micErr) { const nm = micErr && typeof micErr.name === 'string' ? micErr.name : ''; if (nm === 'NotAllowedError' || nm === 'PermissionDeniedError') throw new Error('\u65e0\u6cd5\u8bbf\u95ee\u9ea6\u514b\u98ce\uff1a\u8bf7\u5728\u7cfb\u7edf\u8bbe\u7f6e\u91cc\u5141\u8bb8 DeepSeek Harness \u4f7f\u7528\u9ea6\u514b\u98ce'); if (nm === 'NotFoundError') throw new Error('\u6ca1\u6709\u68c0\u6d4b\u5230\u9ea6\u514b\u98ce\u8bbe\u5907'); throw new Error('\u65e0\u6cd5\u542f\u52a8\u9ea6\u514b\u98ce: ' + (micErr instanceof Error ? micErr.message : String(micErr))) }
-          const url = URL.createObjectURL(new Blob([WORKLET_SOURCE], { type: 'application/javascript' }))
-          await audio.audioWorklet.addModule(url)
-          const source = audio.createMediaStreamSource(stream)
-          const node = new AudioWorkletNode(audio, 'meeting-capture')
-          const sink = audio.createGain()
-          sink.gain.value = 0
-          source.connect(node)
-          node.connect(sink)
-          sink.connect(audio.destination)
-
-          const active = {
-            meetingId: created.meetingId,
-            audio, stream, source, node, sink, url,
-            pending: [],
-            frames: 0,
-            // Audio captured so far in this meeting, in samples. It drives the live elapsed
-            // clock; the host's own count stays authoritative once a cue is transcribed.
-            captured: 0,
-            ticker: 0,
-            silenceFrames: 0,
-            inflight: false,
-            stopping: false,
-            // A paused capture drops what a pause would otherwise record (§5.6).
-            paused: false,
-          }
-          recorder.active = active
-          node.port.onmessage = (event) => {
-            // While paused nothing is buffered, so the exported recording carries no hole.
-            if (active.paused === true) return
-            const block = event.data
-            active.pending.push(block)
-            active.frames += block.length
-            active.captured += block.length
-            // Endpoint at a pause instead of a fixed clock: a cue then holds what a
-            // speaker actually said, rather than being cut mid-sentence. The cap keeps
-            // a long monologue from growing without bound.
-            if (blockRms(block) < CUES.silenceRms) active.silenceFrames += block.length
-            else active.silenceFrames = 0
-            if (!active.inflight && shouldFlush(active)) void flush(active)
-          }
-          // The elapsed clock ticks on captured audio, not on wall time: a pause stops the
-          // count without leaving a gap in the recording (§5.6).
-          active.ticker = setInterval(() => {
-            if (active.paused === true) return
-            setSeconds(Math.round(active.captured / active.audio.sampleRate))
-          }, 1000)
-          setPaused(false)
-          pausedAt.current = 0
-          pauseWarned.current = false
-          setSegments([])
-          setSeconds(0)
-          setMeetingId(created.meetingId)
-          setStartedAt(created.startedAt ?? Date.now())
-          setAudioName(typeof created.audioName === 'string' ? created.audioName : '')
-          setPhase('recording')
-          // Recording belongs to this Session: show that conversation in the main panel and
-          // this meeting's record in the right column, whatever was in front before.
-          try {
-            if (typeof props.revealConversation === 'function') props.revealConversation(sessionId)
-          } catch (failure) {
-            console.warn('meeting-room: could not reveal the meeting conversation', failure)
-          }
-          try {
-            if (typeof props.focusMeetingPanel === 'function') props.focusMeetingPanel()
-          } catch (failure) {
-            console.warn('meeting-room: could not bring the meeting tab forward', failure)
-          }
+          if (typeof props.focusMeeting === 'function') props.focusMeeting()
+        } catch (failure) {
+          console.warn('meeting-room: could not take over the frame for the meeting', failure)
+        }
+        try {
+          const created = await post('/resume', { meetingId })
+          setStoppedAt(0)
+          setStopArmed(false)
+          await beginCapture(created, { continue: true })
+          setNote(t('resumedNote'))
         } catch (failure) {
           await release()
           setPhase('idle')
           setError(failure instanceof Error ? failure.message : String(failure))
         }
-      }, [flush, release, sessionId, termsText, speech.ready, prepareSpeech])
+      }, [beginCapture, meetingId, prepareSpeech, release, speech.ready, t])
 
       // A pending start fires the moment the model reports ready — no second click, and
       // no dialog asking again. Cancelling the intent (below) clears the flag first.
       React.useEffect(() => {
         if (pendingStart && speech.ready === true && phase === 'idle') {
           setPendingStart(false)
-          void start()
+          // The person may have pressed 继续记录 rather than 开始记录 while the model was still
+          // being prepared; the flag remembers which of the two to carry out.
+          const again = pendingResume.current
+          pendingResume.current = false
+          void (again ? resume() : start())
         }
-      }, [pendingStart, speech.ready, phase, start])
+      }, [pendingStart, speech.ready, phase, resume, start])
 
       // The agent can ask the panel to start recording (meeting-scribe: "开始记录" with no
       // naming step). The microphone belongs to the browser, so the panel carries it out
@@ -4046,6 +4185,9 @@ function periodBucketOf(startedAt, unit) {
       const stop = React.useCallback(async () => {
         const active = recorder.active
         if (active === null) return
+        // A confirmed stop cancels any half-armed one waiting behind it.
+        setStopArmed(false)
+        window.clearTimeout(stopArmTimer.current)
         active.stopping = true
         // Stop always leaves the panel unpaused, even when the meeting was paused: a
         // finished meeting cannot be "resumed" (§5.6).
@@ -4058,10 +4200,22 @@ function periodBucketOf(startedAt, unit) {
         const startedAt = Date.now()
         const waited = () => `${Math.round((Date.now() - startedAt) / 1000)}s`
         const waiting = toast(t('stopFinishing'), { sticky: true })
+        // The same two numbers as the toast, under the button that was pressed: how many cues
+        // are still being recognised and how long this has taken. `inflight` counts as one
+        // because a cue already sent to the recogniser has not come back yet.
+        const showProgress = (done = false) => {
+          setFinishing({
+            remaining: active.inflight ? active.pending.length + 1 : active.pending.length,
+            seconds: Math.round((Date.now() - startedAt) / 1000),
+            done,
+          })
+        }
+        showProgress()
         // A ticking clock proves the page is alive even while `/stop` re-labels the whole
         // recording and sends no progress back.
         const ticker = setInterval(() => {
           updateToast(waiting, `${t('stopFinishing')} ${t('stopElapsed')} ${waited()}`)
+          showProgress()
         }, 1000)
         try {
           for (let attempt = 0; attempt < 120 && (active.inflight || active.pending.length > 0); attempt++) {
@@ -4079,15 +4233,50 @@ function periodBucketOf(startedAt, unit) {
           setSegments(reply.segments)
           setSeconds(reply.seconds)
           if (typeof reply.audioName === 'string') setAudioName(reply.audioName)
+          // The WAV was just patched shut (and may have grown since a continue): drop the
+          // player's cached bytes so playback reflects the file on disk.
+          setAudioRev((value) => value + 1)
           updateToast(waiting, `${t('stopFinished')} ${waited()}`)
-          setTimeout(() => dismissToast(waiting), 2500)
+          showProgress(true)
+          // The meeting can be picked up again: the primary button becomes 继续记录 (see
+          // `resumable`), which reopens the microphone on THIS record instead of a new one.
+          setStoppedAt(Date.now())
+          setTimeout(() => {
+            dismissToast(waiting)
+            setFinishing(null)
+          }, 2500)
         } catch (failure) {
           clearInterval(ticker)
           dismissToast(waiting)
+          setFinishing(null)
+          setStoppedAt(0)
           setError(failure instanceof Error ? failure.message : String(failure))
         }
         setPhase('idle')
       }, [dismissToast, flush, release, t, toast, updateToast])
+
+      /**
+       * Stop in two presses. The Stop and Pause buttons sit side by side, and a click meant for
+       * "just a break" must not end the meeting: the first press only arms, the second within
+       * four seconds stops. Arming expires on its own, so a stray click leaves nothing live.
+       */
+      const armStop = React.useCallback(() => {
+        if (stopArmed) {
+          // The second click of a double click must not confirm: a press inside the window is
+          // swallowed, and the arm simply stays armed for a deliberate one.
+          if (Date.now() - stopArmedAt.current < STOP_ARM_DELAY_MS) return
+          setStopArmed(false)
+          window.clearTimeout(stopArmTimer.current)
+          void stop()
+          return
+        }
+        stopArmedAt.current = Date.now()
+        setStopArmed(true)
+        window.clearTimeout(stopArmTimer.current)
+        stopArmTimer.current = window.setTimeout(() => setStopArmed(false), 4000)
+      }, [stop, stopArmed])
+
+      React.useEffect(() => () => { window.clearTimeout(stopArmTimer.current) }, [])
 
       /** Write the SRT record and its Markdown companion into the host's meetings directory. */
 
@@ -4123,6 +4312,13 @@ function periodBucketOf(startedAt, unit) {
       }, [t, terms, visible])
 
       const recording = phase === 'recording' || phase === 'transcribing'
+      /**
+       * True when the meeting on screen has just stopped and can be picked up again. The primary
+       * button then reads 继续记录 instead of 开始记录: "start" on a stopped meeting used to open a
+       * second, empty record, which is exactly what made a mistaken Stop look like data loss.
+       */
+      const resumable = !recording && viewed === null && phase === 'idle'
+        && recorder.active === null && stoppedAt !== 0 && meetingId !== ''
       // A meeting counts as having content from notes, tasks or documents alone: recording is
       // not a precondition for writing minutes, pushing work or exporting Word.
       const hasContent = segments.length > 0 || points.length > 0 || tasks.length > 0
@@ -4218,23 +4414,47 @@ function periodBucketOf(startedAt, unit) {
           h(Btn, {
             key: 'toggle',
             type: 'button',
-            style: recording ? styles.buttonActive : styles.button,
-            disabled: phase === 'starting' || pendingStart,
+            // While a meeting runs, Stop is deliberately the quiet button and Pause the accented one:
+            // the common intention gets the stronger affordance, so the wrong click is rarer
+            // than any confirmation can make it. An armed Stop is painted as the risk it is.
+            style: recording
+              ? (stopArmed ? { ...styles.button, ...styles.buttonDanger } : { ...styles.button, ...styles.buttonQuiet })
+              : styles.button,
+            // A stop in progress owns the button: a second press would drag the audio out from
+            // under the drain that is already running, and the line below says why it is busy.
+            disabled: phase === 'starting' || pendingStart || finishing !== null,
             onClick: () => {
-              if (recording) { void stop(); return }
+              // A stop takes two presses (armStop): a click meant for Pause only arms it.
+              if (recording) { armStop(); return }
+              // 继续记录: reopen the microphone on the record that just stopped, rather than
+              // opening a second, empty meeting beside it.
+              if (resumable) { void resume(); return }
               // Name the meeting once before the first recording (§5.5). The dialog also
               // carries the role, so the seat is chosen where the meeting starts.
               if (meta.title !== '') { void start(); return }
               setNamePrompt({ text: '', kind: meta.kind, role: role === '' ? 'attendee' : role, roleOther: '', start: true })
             },
-          }, recording ? t('stop') : pendingStart ? t('preparing') : t('start')),
+          }, recording
+            ? (stopArmed ? t('stopConfirm') : t('stop'))
+            : pendingStart ? t('preparing') : resumable ? t('resumeMeeting') : t('start')),
+          // 继续记录 must never double as 新建会议: a stopped meeting can still be closed out and
+          // a fresh one begun, so both choices are visible at the same moment.
+          resumable ? h(Btn, {
+            key: 'newmeeting',
+            type: 'button',
+            style: styles.smallButton,
+            onClick: () => {
+              if (meta.title !== '') { void start(); return }
+              setNamePrompt({ text: '', kind: meta.kind, role: role === '' ? 'attendee' : role, roleOther: '', start: true })
+            },
+          }, t('newMeeting')) : null,
           // Pause sits beside Stop: a pause keeps the meeting open, Stop ends it (§5.6). The
           // button stays put for the whole recording — it used to vanish for the moment a
           // chunk was being written, which reads as a fault — and is only disabled then.
           recording ? h(Btn, {
             key: 'pause',
             type: 'button',
-            style: paused ? styles.buttonActive : styles.button,
+            style: paused ? styles.buttonActive : { ...styles.button, ...styles.buttonPrimary },
             // Pausing is local and must work immediately; only a capture that has not
             // started yet has nothing to pause (§5.6).
             disabled: phase === 'starting',
@@ -4446,6 +4666,26 @@ function periodBucketOf(startedAt, unit) {
             onClick: () => setHelpOpen((value) => !value),
           }, '?'),
         ]),
+        // An armed stop says what the second press does, and points at the harmless button. The
+        // live region is what tells a screen reader that the button they are on just changed
+        // meaning — the label alone would go unannounced because focus has not moved.
+        stopArmed ? h('p', {
+          key: 'stophint',
+          // The hint style is made for inline spans; a paragraph brings its own margins.
+          style: { ...styles.hint, margin: '2px 0 0' },
+          role: 'status',
+          'aria-live': 'polite',
+        }, t('stopConfirmHint')) : null,
+        // The progress of a stop, directly under the Start/Stop button — the button the person
+        // just pressed. The corner toast keeps the same words, so nothing was moved away; this
+        // line exists because the person's eyes are on the button, not in the corner. The
+        // finished state lingers for the toast's own 2.5 seconds so the outcome is not missed.
+        finishing === null || viewed !== null ? null : h('p', {
+          key: 'finishing',
+          style: styles.finishLine,
+        }, finishing.done === true
+          ? `${t('stopFinished')} · ${finishing.seconds}s`
+          : `${t('stopFinishing')}　${t('stopRemaining')} ${finishing.remaining} · ${t('stopElapsed')} ${finishing.seconds}s`),
           viewed === null ? null : h('div', { key: 'viewer', style: styles.row }, [
             h('span', { key: 'label', style: styles.status }, `${t('historyViewing')}: ${meta.title === '' ? t('meetingNameNone') : meta.title}${meta.period === '' ? '' : ` · ${meta.period}`}`),
             typeof props.openConversation !== 'function' || viewed.sessionId === '' ? null : h(Btn, {
@@ -4491,7 +4731,7 @@ function periodBucketOf(startedAt, unit) {
           controls: true,
           preload: 'none',
           style: styles.audio,
-          src: `${PREFIX}/audio?name=${encodeURIComponent(audioName)}`,
+          src: `${PREFIX}/audio?name=${encodeURIComponent(audioName)}&rev=${audioRev}`,
           onTimeUpdate: (event) => setPlayhead(event.currentTarget.currentTime),
           onPlay: () => setPlaying(true),
           onPause: () => setPlaying(false),
@@ -7673,6 +7913,8 @@ function periodBucketOf(startedAt, unit) {
             ctx.sidebarRight.toggleExpanded()
             if (readRailCollapsed() === true) ctx.layout.toggleSidebar()
             if (savedRightbar !== null) setRightbarWidth(savedRightbar)
+            // The frame is the person's again, so the next take-over saves what it finds then.
+            savedRightbar = null
             return
           }
           openMeetingFocus()
@@ -7680,22 +7922,77 @@ function periodBucketOf(startedAt, unit) {
 
         /**
          * Open the meeting panel without ever closing it. `focus` (the default, used by a
-         * click on the header button) also collapses the workspace rail and widens the column;
-         * the automatic open that follows a click in the management page passes false, so the
-         * person keeps their rail and their panel width.
+         * click on the header button, by a recording that starts and by the pending-start
+         * watcher) also collapses the workspace rail and widens the column; the automatic
+         * open that follows a click in the management page passes false, so the person keeps
+         * their rail and their panel width.
+         *
+         * Repeating the call is harmless: a column already at its maximum must not record
+         * that maximum as the width to restore when the person closes it again.
          * @param focus - whether to take over the frame as well.
          * @returns whether the column accepted the tab.
          */
         function openMeetingFocus(focus = true) {
-          if (focus && readRailCollapsed() === false) ctx.layout.toggleSidebar()
-          // Opening expands the column and seeds its default width when it never had one.
-          ctx.sidebarRight.openTab(TAB_KIND)
+          // Opening expands the column and seeds its default width when it never had one. This
+          // comes first and alone: when the column refuses the tab (no mounted conversation
+          // surface, e.g. the management page is on screen) nothing else may move, or the
+          // person is left with a collapsed workspace and no panel to show for it.
+          try {
+            ctx.sidebarRight.openTab(TAB_KIND)
+          } catch (failure) {
+            console.warn('meeting-room: the right panel refused the tab', failure)
+            return false
+          }
           if (focus !== true) return true
+          if (readRailCollapsed() === false) ctx.layout.toggleSidebar()
           const info = layoutStore()?.getSnapshot?.()?.layoutInfo
-          savedRightbar = typeof info?.rightbar === 'number' ? info.rightbar : null
-          setRightbarWidth(info?.viewportWidth ?? window.innerWidth)
+          const viewport = typeof info?.viewportWidth === 'number' ? info.viewportWidth : window.innerWidth
+          const current = typeof info?.rightbar === 'number' ? info.rightbar : 0
+          // Only a width the person chose is worth restoring: one already at (or near) the
+          // maximum is this very take-over, and restoring it later would leave the column
+          // permanently wide.
+          if (savedRightbar === null && current > 0 && current < viewport * 0.9) savedRightbar = current
+          setRightbarWidth(viewport)
           return true
         }
+
+        /**
+         * Open the column for a start the agent asked for.
+         *
+         * The panel's own `/record` poll runs inside the panel, so a request made while the
+         * column is shut would wait for a panel that never opens — the request looked like a
+         * failure even though the host had stored it. Watching the host here closes that gap:
+         * the request itself performs the header button's take-over, the panel mounts, and
+         * the panel's existing poll starts the recording. It also means the model never has
+         * to drive the layout: whether its reply is complete, terse or cut off by the
+         * provider's output filter, the take-over has already happened in code.
+         */
+        let watchedStart = 0
+        async function watchPendingStart() {
+          // A background tab cannot start a microphone worth recording, so leave it alone.
+          if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+          let pending
+          try {
+            pending = await get('/pending')
+          } catch {
+            // No meeting yet, or the host is restarting: the next tick tries again.
+            return
+          }
+          const stamp = typeof pending.request === 'number' ? pending.request : 0
+          if (stamp <= 0 || stamp === watchedStart) return
+          watchedStart = stamp
+          // The panel refuses a request this old; the frame must not move for it either.
+          if (Date.now() - stamp > 120_000) return
+          try {
+            openMeetingFocus()
+          } catch (failure) {
+            console.warn('meeting-room: the pending start could not open the meeting column', failure)
+          }
+        }
+        ctx.effect(() => {
+          const timer = window.setInterval(() => { void watchPendingStart() }, 2000)
+          return () => window.clearInterval(timer)
+        }, 'meeting-room: pending start watcher')
 
         /**
          * Submit a prompt carrying one drawing into a session, so handwriting recognition
@@ -7782,6 +8079,21 @@ function periodBucketOf(startedAt, unit) {
                 return true
               } catch (failure) {
                 console.warn('meeting-room: could not focus the meeting tab', failure)
+                return false
+              }
+            },
+            /**
+             * Take the frame for this meeting: the header button's own take-over — workspace
+             * rail in, column open, column at its widest. A recording that starts calls this,
+             * so the layout is identical whoever asked for the start (the panel's button, the
+             * start page's card, or the agent's request).
+             * @returns whether the take-over ran.
+             */
+            focusMeeting: () => {
+              try {
+                return openMeetingFocus()
+              } catch (failure) {
+                console.warn('meeting-room: could not take over the frame for the meeting', failure)
                 return false
               }
             },
