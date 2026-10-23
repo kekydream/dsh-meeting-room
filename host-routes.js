@@ -46,6 +46,7 @@ import {
   contentTypeOf,
   wavFromPcm,
   wavHeader,
+  WAV_HEADER_BYTES,
   clockOf,
   findMeeting,
   pythonExecutable,
@@ -268,6 +269,55 @@ export function createHandler(ctx) {
         return
       }
 
+      // Continue the recording that just stopped, instead of opening a second, empty meeting
+      // beside it. Stop sits one click away from Pause, so an accidental stop must be walkable
+      // back: the same meeting gets the microphone again, its PCM keeps appending to the same
+      // WAV, and the cues continue on the timeline the meeting already has.
+      if (method === 'POST' && route === '/resume') {
+        const body = JSON.parse((await readBody(req)).toString('utf8'))
+        const meeting = meetings.get(typeof body.meetingId === 'string' ? body.meetingId : '')
+        if (meeting === undefined) {
+          sendJson(res, 404, { error: 'unknown meeting' })
+          return
+        }
+        // Nothing was ever recorded (notes only), so there is nothing to continue.
+        if (typeof meeting.audioPath !== 'string' || meeting.audioPath === '' || typeof meeting.audioName !== 'string' || meeting.audioName === '') {
+          sendJson(res, 409, { error: '这个会议还没有录音，直接点「开始记录」即可' })
+          return
+        }
+        // Already capturing: the panel is out of date, not asking for a second capture.
+        if (meeting.audioHandle !== undefined) {
+          sendJson(res, 200, {
+            meetingId: meeting.id, sampleRate: SAMPLE_RATE, startedAt: meeting.startedAt,
+            audioName: meeting.audioName, seconds: meeting.seconds, resumed: false,
+          })
+          return
+        }
+        const handle = await open(meeting.audioPath, 'r+')
+        // The finalized file ends at its last cue. Anything past that is a half-written cue from
+        // a crash and must go, or the resumed audio would start after a silent gap. The header
+        // is rewritten at the next stop, so its stale sizes are harmless meanwhile.
+        try {
+          const info = await handle.stat()
+          const payload = WAV_HEADER_BYTES + meeting.audioBytes
+          if (info.size > payload) await handle.truncate(payload)
+        } catch (failure) {
+          await handle.close().catch(() => undefined)
+          throw failure
+        }
+        meeting.audioHandle = handle
+        // The controller was aborted by the stop; recognition is bound to its signal.
+        meeting.controller = new AbortController()
+        // The agent's five-minute loop stopped with the recording, so a resume asks it to take
+        // the meeting up again — the same prompt a manual Start sends.
+        await nudgeScribe(ctx, meeting.sessionId, meeting, body.auto === true)
+        sendJson(res, 200, {
+          meetingId: meeting.id, sampleRate: SAMPLE_RATE, startedAt: meeting.startedAt,
+          audioName: meeting.audioName, seconds: meeting.seconds, resumed: true,
+        })
+        return
+      }
+
       if (method === 'POST' && route === '/ensure') {
         const body = JSON.parse((await readBody(req)).toString('utf8'))
         const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
@@ -336,7 +386,9 @@ export function createHandler(ctx) {
         // Persist the audio before recognition, so a transcription failure never costs
         // the recording itself.
         if (meeting.audioHandle !== undefined) {
-          await meeting.audioHandle.write(pcm)
+          // Written at an explicit position, not "wherever the handle happens to be": a resumed
+          // recording reopens the same file, and an unpositioned write would land on its header.
+          await meeting.audioHandle.write(pcm, 0, pcm.length, WAV_HEADER_BYTES + meeting.audioBytes)
           meeting.audioBytes += pcm.length
         }
         const before = meeting.segments.length
@@ -599,9 +651,28 @@ export function createHandler(ctx) {
         return
       }
 
+      // The newest start an agent asked for, whichever meeting it belongs to. `/record` below is
+      // polled from inside the panel, so a request made while the meeting column is shut would
+      // wait for a panel that never opens. The plugin's client half watches this route instead
+      // and opens the column itself — the same take-over the header button performs — after
+      // which the mounted panel consumes the request through `/record` as usual.
+      if (method === 'GET' && route === '/pending') {
+        let newest
+        for (const meeting of meetings.values()) {
+          if (typeof meeting.recordRequestedAt !== 'number') continue
+          // A meeting already capturing has nothing left to hand over: someone acted on it.
+          if (meeting.audioHandle !== undefined) continue
+          if (newest === undefined || meeting.recordRequestedAt > newest.recordRequestedAt) newest = meeting
+        }
+        sendJson(res, 200, newest === undefined
+          ? { request: 0 }
+          : { request: newest.recordRequestedAt, meetingId: newest.id, sessionId: newest.sessionId })
+        return
+      }
+
       // A start-recording request from the agent. The microphone is the browser's, so this is a
-// hand-off, not a capture: the panel polls it and runs its own start(), which keeps the
-// permission prompt, the model preparation and the error messages in one place.
+      // hand-off, not a capture: the panel polls it and runs its own start(), which keeps the
+      // permission prompt, the model preparation and the error messages in one place.
       if (method === 'GET' && route === '/record') {
         const meeting = meetingForSession(url.searchParams.get('sessionId') ?? '', url.searchParams.get('meetingId') ?? '')
         if (meeting === undefined) {

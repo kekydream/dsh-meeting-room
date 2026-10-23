@@ -617,6 +617,49 @@ check('开始页引导有「开始会议」卡片', clientSource.includes("guide
 check('停止录音的收尾等待有 toast', clientSource.includes("toast(t('stopFinishing'), { sticky: true })")
   && clientSource.includes("t('stopRemaining')") && clientSource.includes("t('stopFinished')")
   && clientSource.includes("item.sticky === true") && clientSource.includes('clearInterval(ticker)'))
+// 同一份收尾进度也要出现在「开始记录」按钮下方：右下角的 toast 保留，不是搬家。
+check('收尾进度同时显示在按钮下方且保留右下角提示', clientSource.includes('const [finishing, setFinishing]')
+  && clientSource.includes("key: 'finishing'")
+  && clientSource.includes('styles.finishLine')
+  && clientSource.includes('showProgress(true)')
+  && clientSource.includes("updateToast(waiting, `${t('stopFinished')} ${waited()}`)"))
+// 停止与暂停只隔一个按钮：停止要按两次确认，误停之后还能接回同一场会议。
+check('停止需要二次确认，且可以继续同一场会议', clientSource.includes('const armStop')
+  && clientSource.includes("t('stopConfirm')") && clientSource.includes("t('stopConfirmHint')")
+  && clientSource.includes('const resumable =')
+  && clientSource.includes("t('resumeMeeting')") && clientSource.includes("post('/resume', { meetingId })")
+  && clientSource.includes('beginCapture(created, { continue: true })'))
+// 二次确认还要挡住「双击」：确认窗口内忽略再点；停止是次要按钮、暂停是主按钮，确认态用危险色。
+check('停止确认挡住双击，并按危险级配色', clientSource.includes('STOP_ARM_DELAY_MS')
+  && clientSource.includes('stopArmedAt.current')
+  && clientSource.includes('styles.buttonDanger') && clientSource.includes('styles.buttonQuiet')
+  && clientSource.includes('styles.buttonPrimary')
+  && clientSource.includes("'aria-live': 'polite'"))
+
+// 误点停止之后：同一场会议继续写，音频追加在原来那段后面，而不是另开一个空会议。
+const resumeStart = await call('/start', { sessionId: 'session-resume' }, 'POST')
+const resumeId = resumeStart.value.meetingId
+const resumeWav = join(exportDirectory(), resumeStart.value.audioName)
+await call('/stop', { meetingId: resumeId }, 'POST')
+const resumed = await call('/resume', { meetingId: resumeId }, 'POST')
+check('停止后可以继续同一场会议', resumed.status === 200 && resumed.value.resumed === true
+  && resumed.value.meetingId === resumeId && resumed.value.seconds === 0)
+const resumedTwice = await call('/resume', { meetingId: resumeId }, 'POST')
+check('已经在录时再点继续不会重开采集', resumedTwice.value.resumed === false)
+// 识别服务在冒烟里不存在：路由会在识别处报错，但音频在识别之前就已按位置落盘。
+const pcmOnce = Buffer.alloc(3200, 7)
+await call('/chunk', { meetingId: resumeId, pcm: pcmOnce.toString('base64') }, 'POST')
+const afterChunk = await fs.readFile(resumeWav)
+check('继续时的音频追加在原文件末尾（没有覆盖头部）', afterChunk.length === 44 + pcmOnce.length
+  && afterChunk.subarray(0, 4).toString('ascii') === 'RIFF')
+await call('/stop', { meetingId: resumeId }, 'POST')
+const repatched = await fs.readFile(resumeWav)
+check('再次收尾把追加后的长度写回 WAV 头', repatched.readUInt32LE(40) === pcmOnce.length
+  && repatched.readUInt32LE(4) === 36 + pcmOnce.length)
+const notesOnly = await call('/ensure', { sessionId: 'session-resume-notes' }, 'POST')
+const noAudio = await call('/resume', { meetingId: notesOnly.value.meetingId }, 'POST')
+check('没有录音的会议不能「继续」，会给出可操作提示', noAudio.status === 409
+  && String(noAudio.value.error).includes('开始记录'))
 
 // ---------------------------------------------------------------------------
 // 7g. M3：阈值可调、全量重判、跨会议声纹库（建议姓名需人确认）
@@ -760,6 +803,27 @@ check('面板可读到开始录音请求', recordRoute.status === 200 && recordR
 const clearedRoute = await call('/record', { sessionId: 'session-scribe-new' }, 'POST')
 check('面板领取后请求被清除', clearedRoute.value.cleared === true && autoMeeting.recordRequestedAt === undefined)
 
+// 面板没打开时，请求也必须能开局：插件层的看守先读 /pending，再由它自己接管界面。
+const idlePending = await call('/pending')
+check('待处理请求可被插件层读到（没有时为空）', idlePending.status === 200
+  && typeof idlePending.value.request === 'number')
+const pendingAgent = { agent: { session: { id: 'session-pending' } } }
+tools.meetingSession({ action: 'create' }, pendingAgent)
+tools.meetingSession({ action: 'record' }, pendingAgent)
+const pendingNow = await call('/pending')
+check('看守能读到最新的开始请求与所属会话', pendingNow.value.request > 0
+  && pendingNow.value.sessionId === 'session-pending')
+await call('/record', { sessionId: 'session-pending' }, 'POST')
+check('请求被领取后看守不再重复接管界面', (await call('/pending')).value.request === 0)
+// 接管界面的动作只能有一份实现：开始录音的路径调用的就是「会议记录」按钮那套动作。
+check('开始录音前按「会议记录」按钮的动作接管界面', clientSource.includes('props.focusMeeting()')
+  && clientSource.includes('focusMeeting: () => {')
+  && clientSource.includes('return openMeetingFocus()'))
+check('面板没挂载时由插件层看守打开会议列', clientSource.includes("get('/pending')")
+  && clientSource.includes('watchPendingStart') && clientSource.includes("setInterval(() => { void watchPendingStart() }"))
+check('接管后关闭会还原用户原来的宽度，不会被最大值污染', clientSource.includes('current < viewport * 0.9')
+  && clientSource.includes('savedRightbar = null'))
+
 // 人点「开始记录」时，录音之外还要让 agent 自己开工：/start 向该会话投一条普通 prompt。
 const prompted = []
 const nudgeCtx = {
@@ -793,6 +857,7 @@ check('meeting-scribe 技能说明包含 5 分钟循环与自动停止', scribeS
 check('技能在插件激活时注册到 skills 服务', (await fs.readFile(join(here, 'index.js'), 'utf8')).includes('skills.register(MEETING_SCRIBE_SKILL)'))
 check('技能写明可无参数开始并按前 5 分钟命名', scribeSkill.MEETING_SCRIBE_SKILL.content.includes('不带任何参数')
   && scribeSkill.MEETING_SCRIBE_SKILL.content.includes('action:"record"')
+  && scribeSkill.MEETING_SCRIBE_SKILL.content.includes('界面由插件自己摆')
   && scribeSkill.MEETING_SCRIBE_SKILL.content.includes('第一轮') && scribeSkill.MEETING_SCRIBE_SKILL.content.includes('6–16 字'))
 
 // 语速快时一个 cue 里会有好几句：按标点拆行，云端的 segment 边界优先。

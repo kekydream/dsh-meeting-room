@@ -50,9 +50,12 @@ export const MEETING_SCRIBE_SKILL = {
    周期由系统推导，不要问。
    **不要**为了填名称而停下——名称留给第 5 步。
 3. \`meeting_session {action:"record"}\`：请求会议面板自动开始录音。
+   - **界面由插件自己摆**：接到请求后，面板会照「会议记录」按钮的动作接管界面——收起左侧
+     工作区、打开右侧会议记录卡片、把卡片宽度放到最大——然后才打开麦克风。你**不要**描述
+     或尝试操作界面（写「我帮你点开右侧卡片」「把面板拖宽」这类话没有意义，也做不到）。
    - 这是**请求**，不是替用户开麦克风：面板会在几秒内开始，浏览器第一次会询问麦克风权限。
-   - 你**不要**声称「已经开始录音」，而要说「已请求开始，面板会自动开启；如果十几秒还没开始，
-     请点一下面板的『开始记录』」。
+   - 你**不要**声称「已经开始录音」，而要说「面板会自动打开并开始；如果十几秒还没开始，
+     请点面板的『开始记录』」。
    - 回执说「录音已经在进行中」就不要再请求。
 4. 建一个 5 分钟循环提醒（只建一个）：
    - 先 \`schedule_list\`；已有标题「会议要点整理」的提醒就复用，不再新建。
@@ -83,6 +86,8 @@ export const MEETING_SCRIBE_SKILL = {
 - \`recording: true\` → 继续整理。
 - \`recording: false\` → 会议已结束，执行收尾（第四节），然后 **schedule_delete** 掉「会议要点整理」提醒。
 - 用户说「结束会议」但录音还在：提醒他去面板点停止；不要替他停麦克风。
+- 用户说只是**暂停**、或说误点了停止：告诉他面板上有「继续记录」，点一下会接着同一场会议录，
+  实录、要点与工作安排都还在，不必另开会议；这时不要收尾、不要删提醒，等他用「继续记录」回来。
 
 ## 四、每轮做什么（录音进行中）
 
@@ -107,6 +112,9 @@ export const MEETING_SCRIBE_SKILL = {
 ## 六、硬性规则
 
 - 开始会议**不需要**用户提供名称或参数；不要因为「还没起名」而等待。
+- 界面接管（收起工作区、打开并拉宽会议卡片）由插件代码完成：你只发 \`record\` 请求，
+  回复里不写「点哪个按钮、拖多宽」这类操作步骤；即使你的输出被平台拦截，
+  界面的接管也已经发生，不要因此判断「开始失败」。
 - 名称只在第一轮补一次，且只补空名/占位名；用户起的名字永远不改。
 - 要点与工作安排都是**草稿**，需要人在面板里确认；不要说「已定稿」。
 - 不创建第二个循环提醒；每轮先 \`schedule_list\` 检查。
@@ -119,5 +127,5 @@ export const MEETING_SCRIBE_SKILL = {
 /** The tool registration text for `meeting_session`, kept beside the skill it serves. */
 export const MEETING_SESSION_TOOL = {
   name: 'meeting_session',
-  description: 'Create/configure this session\'s meeting, request that the panel start recording, or read whether it is still recording. Use action "create" (no arguments needed) to create or name the meeting and set its type (briefing, review, weekly, monthly, or empty for an ad-hoc meeting); action "record" leaves a start request the meeting panel picks up within seconds — the microphone stays the browser\'s, so if it is blocked the panel says why; action "status" reports recording state, elapsed time, cue count and how many points/tasks are stored.',
+  description: 'Create/configure this session\'s meeting, request that the panel start recording, or read whether it is still recording. Use action "create" (no arguments needed) to create or name the meeting and set its type (briefing, review, weekly, monthly, or empty for an ad-hoc meeting); action "record" leaves a start request the meeting panel picks up within seconds and opens itself for — the same take-over as the header\'s 会议记录 button (workspace rail in, meeting column open at its widest) — the microphone stays the browser\'s, so if it is blocked the panel says why; action "status" reports recording state, elapsed time, cue count and how many points/tasks are stored.',
 }

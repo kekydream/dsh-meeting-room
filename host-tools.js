@@ -67,6 +67,7 @@ import {
   pythonExecutable,
   wavFromPcm,
   wavHeader,
+  WAV_HEADER_BYTES,
 } from './host-helpers.js'
 
 import { flushMeetings } from './host-persistence.js'
@@ -1181,7 +1182,7 @@ export async function finalizeRecording(ctx, meeting) {
   // Patch the WAV sizes and close the file so the recording is a complete, seekable file.
   if (meeting.audioHandle !== undefined) {
     try {
-      await meeting.audioHandle.write(wavHeader(meeting.audioBytes, SAMPLE_RATE), 0, 44, 0)
+      await meeting.audioHandle.write(wavHeader(meeting.audioBytes, SAMPLE_RATE), 0, WAV_HEADER_BYTES, 0)
     } finally {
       await meeting.audioHandle.close()
       meeting.audioHandle = undefined
@@ -1886,8 +1887,11 @@ export async function readTranscript(args, exec) {
  *
  * The microphone belongs to the browser panel, so `record` does not open it: it leaves a
  * request the panel picks up within a few seconds and acts on with the same code path as
- * its own Start button. That is the honest version of "start recording from the chat" —
- * if the browser blocks the microphone, the panel says so instead of pretending.
+ * its own Start button — including that path's take-over of the frame (workspace rail in,
+ * meeting column open at its widest), which a client-side watcher performs even when the
+ * column was shut, so the request cannot sit unanswered. That is the honest version of
+ * "start recording from the chat" — if the browser blocks the microphone, the panel says so
+ * instead of pretending.
  * The five-minute scribe loop needs the rest: set the name/type up front, and know
  * whether the recording has stopped (so the loop can finish and delete itself).
  * @param args - Model arguments, validated here because a raw definition is not.
@@ -1926,9 +1930,11 @@ export function meetingSession(args, exec) {
     if (meeting.audioHandle !== undefined) {
       return '录音已经在进行中，无需重复开始。可以直接开始每 5 分钟的整理。'
     }
-    // A request, not a capture: the panel polls for it and calls its own start().
+    // A request, not a capture: the panel opens itself (the header button's take-over — rail
+    // in, column open at its widest) and calls its own start().
     meeting.recordRequestedAt = Date.now()
-    return '已请求开始录音：会议面板会在几秒内自动开始（浏览器第一次会询问麦克风权限）。'
+    return '已请求开始录音：会议面板会自动打开并放到最宽、同时收起左侧工作区，'
+      + '随后在几秒内开始录音（浏览器第一次会询问麦克风权限）。'
       + '若十几秒后仍未开始，请在面板点「开始记录」。'
   } else if (action !== 'status') {
     return `未知的 action：${action}。可用 create、record 或 status。`

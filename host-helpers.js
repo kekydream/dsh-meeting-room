@@ -88,13 +88,19 @@ export function wavFromPcm(pcm, sampleRate) {
 }
 
 /**
+ * Bytes of the canonical WAV header every recording starts with. A recording that is resumed
+ * keeps writing its PCM after this many bytes of payload, so the position is named once.
+ */
+export const WAV_HEADER_BYTES = 44
+
+/**
  * Build the 44-byte canonical WAV header for 16 kHz mono PCM16.
  * @param dataBytes - PCM payload size in bytes.
  * @param sampleRate - Samples per second.
  * @returns the header bytes.
  */
 export function wavHeader(dataBytes, sampleRate) {
-  const header = Buffer.alloc(44)
+  const header = Buffer.alloc(WAV_HEADER_BYTES)
   header.write('RIFF', 0)
   header.writeUInt32LE(36 + dataBytes, 4)
   header.write('WAVE', 8)
