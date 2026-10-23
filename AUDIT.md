@@ -498,6 +498,9 @@ Set-Location <repo>
   全部用 inset `box-shadow` 画边，切换状态不移位；**读屏**——确认提示 `role="status"` + `aria-live`。
 - 验证：`smoke` 静态守卫（常量、`stopArmedAt`、三个样式、`aria-live`）；手工 26。计数 219 → 220。
 
-### 8.5 版本号
+### 8.5 版本号与发布
 - `package.json` / `README` / `CHANGELOG` 同步到 `0.1.0-preview.7`；`PUBLISHING.md` 标明本版在
   `develop` 上、尚未发布。
+- 发布：PR !5（`release/preview.7` → `master`，审查 + 测试各 1 人）合并为 `a3f0c4b`，标签
+  `v0.1.0-preview.7` 打在合并提交上并推送；`npm publish --tag preview` 成功，36 个文件 /
+  307.0 kB，`preview` 与 `latest` 均指向 0.1.0-preview.7，npmmirror 自动同步。

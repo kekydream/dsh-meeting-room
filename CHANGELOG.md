@@ -5,8 +5,8 @@
 
 ## 0.1.0-preview.7
 
-> 待发布（2026-10-23，`develop`）。发布后按 `PUBLISHING.md` 打标签 `v0.1.0-preview.7`，
-> 并把这一行改成与 preview.6 相同的「已发布」格式。
+> 已发布：npm `dsh-meeting-room@0.1.0-preview.7`（2026-10-23，`latest` 与 `preview` 两个 tag 均指向它），
+> 标签 `v0.1.0-preview.7`（打在 `master` 的合并提交 `a3f0c4b` 上）。详见 `PUBLISHING.md` 的「已发布状态」。
 
 **开始录音就等于按下「会议记录」按钮**：界面接管从「让模型去点按钮」改成「由面板代码自己做」。
 
