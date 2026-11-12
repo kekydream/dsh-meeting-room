@@ -21,6 +21,9 @@ import {
   ROLES,
   ROLE_LABELS,
   SPEAKER_MERGE_THRESHOLD,
+  SPEAKER_MIN_VOICE_SECONDS,
+  SPEAKER_MIN_VOICE_SHARE,
+  SPEAKER_FRAGMENT_GAP_SECONDS,
   SPEAKER_BACKFILL_CAP,
   KIND_PERIOD_UNITS,
   MEETING_KINDS,
@@ -1097,10 +1100,16 @@ export function cosine(left, right) {
  * Merge every cue of one voice under a single label. The online gallery only ever adds
  * entries, so one voice can hold two labels and a noisy cue can hold one forever; this pass
  * clusters the stored embeddings instead and numbers the voices by first appearance.
+ *
+ * Two rules keep the result honest on a long recording: a cluster must carry a real share of
+ * the meeting to count as a person, and the labels left over from earlier passes are dropped
+ * rather than kept as voices nobody spoke.
  * @param meeting - Meeting record.
+ * @param options - `threshold`: cosine above which a cue joins a voice (defaults to the
+ *                  end-of-meeting merge threshold).
  * @returns the number of voices after merging.
  */
-export function relabelSpeakers(meeting) {
+export function relabelSpeakers(meeting, options = {}) {
   const cues = meeting.segments.filter((segment) => typeof segment.embedding === 'string' && segment.embedding !== '')
   if (cues.length < 2) return 0
   const vectors = cues.map((cue) => {
@@ -1109,37 +1118,97 @@ export function relabelSpeakers(meeting) {
     // ArrayBuffer; slicing copies exactly this vector out for the float view.
     return new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength))
   })
-  // Single-linkage clustering: every pair closer than the threshold joins one voice.
-  const parent = cues.map((_, index) => index)
-  const rootOf = (index) => {
-    let current = index
-    while (parent[current] !== current) {
-      parent[current] = parent[parent[current]]
-      current = parent[current]
+  const seconds = cues.map((cue) => Math.max(0, (cue.end ?? 0) - (cue.start ?? 0)))
+  const speech = seconds.reduce((sum, value) => sum + value, 0)
+  const threshold = Number.isFinite(options.threshold) ? options.threshold : SPEAKER_MERGE_THRESHOLD
+
+  // Leader clustering around a running centroid, seeded from the longest cues.
+  //
+  // This used to be single linkage, and that is what turned a 2 h meeting into "one person
+  // said everything": a single noisy vector bridges two voices and the bridge then absorbs
+  // the whole room. Complete linkage fails the other way — far-field noise shatters the
+  // meeting into hundreds of one-cue voices. A running centroid averages a bad vector away
+  // instead of letting it decide, and seeding by cue length means a cluster is born from
+  // real speech rather than from a cough or a door slam.
+  const order = cues.map((_, index) => index).sort((left, right) => seconds[right] - seconds[left])
+  const centroids = []
+  const members = []
+  for (const index of order) {
+    let best = -1
+    let bestScore = -1
+    for (let candidate = 0; candidate < centroids.length; candidate++) {
+      const score = cosine(vectors[index], centroids[candidate])
+      if (score > bestScore) {
+        bestScore = score
+        best = candidate
+      }
     }
-    return current
-  }
-  for (let left = 0; left < cues.length; left++) {
-    for (let right = left + 1; right < cues.length; right++) {
-      if (cosine(vectors[left], vectors[right]) < SPEAKER_MERGE_THRESHOLD) continue
-      const leftRoot = rootOf(left)
-      const rightRoot = rootOf(right)
-      if (leftRoot !== rightRoot) parent[rightRoot] = leftRoot
+    if (best >= 0 && bestScore >= threshold) {
+      members[best].push(index)
+      const centroid = centroids[best]
+      const count = members[best].length
+      for (let element = 0; element < centroid.length; element++) {
+        centroid[element] = (centroid[element] * (count - 1) + vectors[index][element]) / count
+      }
+    } else {
+      centroids.push(Float32Array.from(vectors[index]))
+      members.push([index])
     }
   }
+
+  // A voice has to carry a real share of the meeting. A cluster below the floor is noise
+  // (a cough, a chair, two syllables of cross-talk) and must not appear as a speaker nobody
+  // can name — the "hundreds of people in a four-person meeting" symptom.
+  const floor = Math.max(SPEAKER_MIN_VOICE_SECONDS, speech * SPEAKER_MIN_VOICE_SHARE)
+  const spoken = members.map((group) => group.reduce((sum, index) => sum + seconds[index], 0))
+  const groupOfCue = new Map()
+  for (let group = 0; group < members.length; group++) {
+    if (spoken[group] < floor) continue
+    for (const index of members[group]) groupOfCue.set(index, group)
+  }
+  if (groupOfCue.size === 0) {
+    // Nothing reaches the floor: keep the single largest cluster rather than leaving the
+    // whole meeting unlabelled.
+    let largest = 0
+    for (let group = 1; group < members.length; group++) if (spoken[group] > spoken[largest]) largest = group
+    for (const index of members[largest]) groupOfCue.set(index, largest)
+  }
+
+  // Number the voices by first appearance, in time order, so S1 is whoever spoke first.
+  // A cue without a voice of its own inherits the voice around it (temporal continuity),
+  // which is how a listener would fill it in; failing that it stays unlabelled.
+  const previousSpeakers = cues.map((cue) => cue.speaker)
+  const byTime = cues.map((_, index) => index).sort((left, right) => (cues[left].start ?? 0) - (cues[right].start ?? 0))
   const names = new Map()
-  // Names already assigned must follow the voice, not the old number: the rename below can
-  // change which label a voice holds, so each new group inherits the label it mostly held.
-  const tally = new Map()
-  for (let index = 0; index < cues.length; index++) {
-    const root = rootOf(index)
-    const counts = tally.get(root) ?? new Map()
-    const previous = cues[index].speaker
-    counts.set(previous, (counts.get(previous) ?? 0) + 1)
-    tally.set(root, counts)
+  let previousLabel = ''
+  let previousEnd = Number.NEGATIVE_INFINITY
+  for (const index of byTime) {
+    const group = groupOfCue.get(index)
+    let label = ''
+    if (group !== undefined) {
+      if (!names.has(group)) names.set(group, `S${names.size + 1}`)
+      label = names.get(group)
+    } else if (previousLabel !== '' && (cues[index].start ?? 0) - previousEnd <= SPEAKER_FRAGMENT_GAP_SECONDS) {
+      label = previousLabel
+    }
+    cues[index].speaker = label
+    if (label !== '') {
+      previousLabel = label
+      previousEnd = cues[index].end ?? 0
+    }
   }
+
+  // Names already assigned must follow the voice, not the old number: each new group
+  // inherits the label it mostly held.
   const inherited = new Map()
-  for (const [root, counts] of tally) {
+  for (const [index, group] of groupOfCue) {
+    const counts = inherited.get(group) ?? new Map()
+    const previous = previousSpeakers[index]
+    counts.set(previous, (counts.get(previous) ?? 0) + 1)
+    inherited.set(group, counts)
+  }
+  const renamed = {}
+  for (const [group, counts] of inherited) {
     let best = ''
     let bestCount = -1
     for (const [label, count] of counts) {
@@ -1148,19 +1217,13 @@ export function relabelSpeakers(meeting) {
         best = label
       }
     }
-    if (best !== '') inherited.set(root, best)
-  }
-  for (let index = 0; index < cues.length; index++) {
-    const root = rootOf(index)
-    if (!names.has(root)) names.set(root, `S${names.size + 1}`)
-    cues[index].speaker = names.get(root)
-  }
-  const renamed = {}
-  for (const [root, label] of inherited) {
-    const name = meeting.speakers[label]
-    if (typeof name === 'string' && name !== '') renamed[names.get(root)] = name
+    const name = best === '' ? undefined : meeting.speakers[best]
+    if (typeof name === 'string' && name !== '') renamed[names.get(group)] = name
   }
   meeting.speakers = renamed
+  // Only the labels this pass actually produced. Labels from earlier passes used to stay
+  // behind here, so the panel listed hundreds of speakers for a transcript that had a few.
+  meeting.speakerLabels = [...names.values()].sort((left, right) => Number(left.slice(1)) - Number(right.slice(1)))
   return names.size
 }
 
