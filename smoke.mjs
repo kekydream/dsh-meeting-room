@@ -719,6 +719,77 @@ await call('/speaker/name', { meetingId: 'm-voice', label: 'S1', name: '张三' 
 const voicePackage = await call('/package?meetingId=m-voice')
 const packedRecord = zipRead(voicePackage.body).find((entry) => entry.name === 'meeting.json').data.toString('utf8')
 check('会议记录不落 embedding 与质心', !packedRecord.includes('embedding') && !packedRecord.includes('voiceCentroids'))
+
+// ---------------------------------------------------------------------------
+// 7h. 长会议重判：一条桥接噪声不许把全屋并成一个人，碎片不许变成"人"，旧标签必须清掉
+//
+// 现场症状：2 小时 12 分、1701 段的会议，参会 4 个人，重新识别后实录里出现 316 个说话人，
+// 其中 244 个标签没有任何一段在引用；另有一个标签吃掉 95% 的时长（单链接把所有人串成一串）。
+// 下面用合成的向量把这个场景固定下来。
+// ---------------------------------------------------------------------------
+/** Unit vector along one axis: two different voices score 0, `blend` of them scores .707. */
+const axisOf = (index) => {
+  const vector = Array(16).fill(0)
+  vector[index] = 1
+  return vector
+}
+const blendOf = (left, right) => left.map((value, index) => (value + right[index]) / Math.SQRT2)
+/** Lay cues out back to back: `[embedding, seconds, previousLabel]`. */
+const meetingOfCues = (rows, speakerLabels = [], speakers = {}) => {
+  const segments = []
+  let at = 0
+  for (const [values, seconds, speaker] of rows) {
+    segments.push({ id: `c${segments.length + 1}`, start: at, end: at + seconds, text: '', speaker: speaker ?? '', embedding: encodeVector(values) })
+    at += seconds
+  }
+  return { segments, speakers: { ...speakers }, speakerLabels: [...speakerLabels] }
+}
+/** Talk time per produced label, in seconds. */
+const talkTime = (meeting) => {
+  const tally = new Map()
+  for (const segment of meeting.segments) {
+    if (segment.speaker === '') continue
+    tally.set(segment.speaker, (tally.get(segment.speaker) ?? 0) + segment.end - segment.start)
+  }
+  return tally
+}
+const speakerA = axisOf(0)
+const speakerB = axisOf(1)
+const speakerC = axisOf(2)
+
+// A 12 s cue that is half A and half B sits at cosine .707 from both: single linkage would
+// bridge A and B into one voice through it. A centroid absorbs it instead.
+const bridged = meetingOfCues([
+  [speakerA, 10, 'S1'], [speakerA, 10, 'S1'], [speakerA, 10, 'S1'],
+  [blendOf(speakerA, speakerB), 12, 'S1'],
+  [speakerB, 10, 'S2'], [speakerB, 10, 'S2'], [speakerB, 10, 'S2'],
+])
+check('一条"半人半人"的桥接音频不会把两个人合成一个', tools.relabelSpeakers(bridged) === 2,
+  [...talkTime(bridged).keys()].join(','))
+
+// Three people (30 s each) plus a 1 s noise cue that resembles nobody, and 300 stale labels
+// left over from earlier passes.
+const stale = meetingOfCues([
+  [speakerA, 10, 'S1'], [speakerB, 10, 'S2'], [speakerC, 10, 'S3'],
+  [speakerA, 10, 'S1'], [speakerB, 10, 'S2'], [speakerC, 10, 'S3'],
+  [speakerA, 10, 'S1'], [speakerB, 10, 'S2'], [speakerC, 10, 'S3'],
+  [axisOf(9), 1, 'S1'],
+], Array.from({ length: 300 }, (_, index) => `S${index + 1}`))
+const staleVoices = tools.relabelSpeakers(stale)
+check('一段噪声不会自己变成一个人', staleVoices === 3, `voices=${staleVoices}`)
+check('陈旧标签不会留在记录里（316 个标签的现场症状）', stale.speakerLabels.length === 3
+  && stale.speakerLabels.every((label) => talkTime(stale).has(label)), JSON.stringify(stale.speakerLabels))
+check('每个留下的声音都有真实时长（碎片被并回上下文）', [...talkTime(stale).values()].every((seconds) => seconds >= 15))
+
+// A name must follow the voice through the renumbering, not stay on its old number.
+const namedMeeting = meetingOfCues([
+  [speakerA, 20, 'S1'], [speakerB, 20, 'S2'], [speakerA, 20, 'S1'], [speakerB, 20, 'S2'],
+], ['S1', 'S2'], { S2: '张三' })
+tools.relabelSpeakers(namedMeeting)
+const inheritedNames = Object.entries(namedMeeting.speakers)
+check('改动前挂上的姓名跟着声音走，不会张冠李戴', inheritedNames.length === 1 && inheritedNames[0][1] === '张三'
+  && talkTime(namedMeeting).has(inheritedNames[0][0]), JSON.stringify(namedMeeting.speakers))
+check('会议记录仍保留发言人姓名与标签', packedRecord.includes('张三') && packedRecord.includes('S1'))
 check('会议记录仍保留发言人姓名与标签', packedRecord.includes('张三') && packedRecord.includes('S1'))
 
 // ---------------------------------------------------------------------------

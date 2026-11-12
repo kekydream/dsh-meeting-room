@@ -242,6 +242,19 @@ export const ROLE_LABELS = { host: '主持人', attendee: '参会人', observer:
 /** How close two cue embeddings must be to count as one voice in the end-of-meeting pass. */
 export const SPEAKER_MERGE_THRESHOLD = 0.62
 
+/**
+ * Speech a voice must carry before it counts as a person in the end-of-meeting pass.
+ *
+ * Both a floor and a share, because the failure this guards against scales with meeting
+ * length: a 2 h meeting collected 316 labels for four people, and every one-cue "voice" was
+ * noise. A real attendee clears both by a wide margin.
+ */
+export const SPEAKER_MIN_VOICE_SECONDS = 15
+export const SPEAKER_MIN_VOICE_SHARE = 0.01
+
+/** How far a cue may sit from the previous labelled cue and still inherit its voice. */
+export const SPEAKER_FRAGMENT_GAP_SECONDS = 10
+
 /** Robot webhooks a meeting's confirmed assignments can be pushed to. */
 export const WEBHOOK_KINDS = ['dingtalk', 'wecom']
 
